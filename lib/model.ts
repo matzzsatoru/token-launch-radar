@@ -1,10 +1,13 @@
-// Token Radar, model radar-2: one sealed snapshot in, one ranked board out.
+// Token Radar, model radar-3: one sealed snapshot in, one ranked board out.
 //
 // The board covers every slug on the snapshot's watchlist (the floor, never the
-// ceiling) and adds every pre-token protocol below the floor the radar can rank.
-// A protocol is pre-token when its record carries no token at all: no market
-// cap, no CoinGecko id, no symbol. Protocols whose token already trades are
-// kept apart and shown with the market's own value, never mixed into the board.
+// ceiling) and every rankable pre-token protocol the snapshot records, below
+// the floor or above it. A protocol is pre-token when its record carries no
+// token at all: no market cap, no CoinGecko id, no symbol. Protocols whose
+// token already trades are kept apart and shown with the market's own value,
+// never mixed into the board. Every farm plan is netted: its total cost, the
+// share of the launch value a farmer must capture to break even, and a farm /
+// thin / skip verdict from the board's own tertiles of that share.
 //
 // Implied value follows only from the snapshot's own figures. The multiple is
 // not a guess and not a hardcoded list of names: it is calibrated from the
@@ -79,7 +82,25 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
+
+/** Out-of-sample validation of the calibration: live-token protocols held out
+ * before fitting, scored by the fitted multiples alone. The board is a
+ * ranking, so the rank correlation is the headline: a protocol's launch value
+ * is ranked, not priced to the dollar, and the level error says so plainly. */
+export interface OutOfSample {
+  train: number;
+  test: number;
+  /** Median absolute percentage error of the held-out market caps. */
+  mdape_pct: number;
+  /** Held-out protocols whose predicted market cap lands within 2x of the real one. */
+  within_2x: number;
+  /** Rank (Spearman) correlation between predicted and real market cap. */
+  spearman: number;
+  /** The same two figures for one global multiple, so the category calibration's gain is visible. */
+  global_mdape_pct: number;
+  global_spearman: number;
+}
 
 /** One category's calibrated multiple: the median live mcap/TVL and how many live protocols set it. */
 export interface CategoryMultiple {
@@ -102,6 +123,9 @@ export interface FarmStep {
   cost: string;
   time: string;
 }
+
+/** A farm verdict: farm the launch, farm it thin, or skip it. */
+export type FarmVerdict = 'farm' | 'thin' | 'skip';
 
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
@@ -128,6 +152,12 @@ export interface BoardRow {
     chain_multiplier: number;
     age_days: number | null;
   };
+  /** What the farm plan costs in total: capital plus gas over the plan's transactions. */
+  farm_cost_usd: number;
+  /** The share of the launch value a farmer must capture to break even, in percent. */
+  farm_break_even_pct: number;
+  /** Farm, thin or skip: the board's own tertile of the break-even share. */
+  farm_verdict: FarmVerdict;
   farm_steps: string[];
 }
 
@@ -148,6 +178,9 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
+  farm_cost_usd: number;
+  farm_break_even_pct: number;
+  farm_verdict: FarmVerdict;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -301,6 +334,100 @@ export function multipleFor(category: string | null, calibration: Calibration): 
   return { multiple: calibration.global_multiple, comps: 0 };
 }
 
+/** Spearman rank correlation between two equal-length lists of numbers. */
+function spearman(predicted: number[], actual: number[]): number {
+  const n = predicted.length;
+  if (n < 3) return 0;
+  const rankOf = (values: number[]): Map<number, number> => {
+    const order = values.map((v, i) => ({ v, i })).sort((a, b) => b.v - a.v || a.i - b.i);
+    const ranks = new Map<number, number>();
+    order.forEach((o, r) => ranks.set(o.i, r + 1));
+    return ranks;
+  };
+  const rp = rankOf(predicted);
+  const ra = rankOf(actual);
+  let d2 = 0;
+  for (let i = 0; i < n; i++) {
+    const d = (rp.get(i) ?? 0) - (ra.get(i) ?? 0);
+    d2 += d * d;
+  }
+  return 1 - (6 * d2) / (n * (n * n - 1));
+}
+
+/**
+ * Validate the calibration out of sample. The launch-comparable live-token
+ * protocols are split deterministically — by category, then by slug, every
+ * third one held out — the multiples are fitted on the training two-thirds
+ * only, and the held-out market caps are predicted from TVL times the fitted
+ * multiple. The same split is scored once more with a single global multiple,
+ * so the category calibration's gain is measured, not asserted. The growth,
+ * maturity and chain adjustments are launch adjustments, not market-cap
+ * predictors, so they stay out of this test: it scores the calibration alone.
+ */
+export function validateOutOfSample(snapshot: Snapshot, model: ModelConstants = MODEL): OutOfSample {
+  const comparable = snapshot.protocols.filter(
+    (p) => !isPreToken(p) && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 &&
+      (p.category === null || !NON_LAUNCH_CATEGORIES.has(p.category)),
+  );
+  const byCategory = new Map<string, SnapshotProtocol[]>();
+  for (const p of comparable) {
+    const key = p.category ?? 'Other';
+    const list = byCategory.get(key) ?? [];
+    list.push(p);
+    byCategory.set(key, list);
+  }
+  const train: SnapshotProtocol[] = [];
+  const test: SnapshotProtocol[] = [];
+  for (const key of [...byCategory.keys()].sort()) {
+    const list = [...(byCategory.get(key) ?? [])].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    list.forEach((p, i) => (i % 3 === 2 ? test : train).push(p));
+  }
+  const trainRatios = train.map((p) => p.mcap_usd! / p.tvl_usd);
+  const globalMultiple = Math.min(model.multiple_cap, Math.max(model.multiple_floor, median(trainRatios)));
+  const trainByCategory = new Map<string, number[]>();
+  for (const p of train) {
+    const key = p.category ?? 'Other';
+    const list = trainByCategory.get(key) ?? [];
+    list.push(p.mcap_usd! / p.tvl_usd);
+    trainByCategory.set(key, list);
+  }
+  const fittedMultiple = (category: string | null): number => {
+    const ratios = trainByCategory.get(category ?? 'Other') ?? [];
+    if (ratios.length >= model.min_category_comps) {
+      return Math.min(model.multiple_cap, Math.max(model.multiple_floor, median(ratios)));
+    }
+    return globalMultiple;
+  };
+  const predicted: number[] = [];
+  const actual: number[] = [];
+  const globalPredicted: number[] = [];
+  let within2x = 0;
+  const errors: number[] = [];
+  const errorsGlobal: number[] = [];
+  for (const p of test) {
+    const pred = Math.max(1, p.tvl_usd * fittedMultiple(p.category));
+    const predGlobal = Math.max(1, p.tvl_usd * globalMultiple);
+    const act = p.mcap_usd!;
+    predicted.push(pred);
+    actual.push(act);
+    globalPredicted.push(predGlobal);
+    const err = Math.abs(pred - act) / act;
+    const errGlobal = Math.abs(predGlobal - act) / act;
+    errors.push(err);
+    errorsGlobal.push(errGlobal);
+    if (pred >= act / 2 && pred <= act * 2) within2x++;
+  }
+  return {
+    train: train.length,
+    test: test.length,
+    mdape_pct: Math.round(median(errors) * 1000) / 10,
+    within_2x: within2x,
+    spearman: Math.round(spearman(predicted, actual) * 1000) / 1000,
+    global_mdape_pct: Math.round(median(errorsGlobal) * 1000) / 10,
+    global_spearman: Math.round(spearman(globalPredicted, actual) * 1000) / 1000,
+  };
+}
+
 /** The multipliers and the implied value one protocol gets under `model` and `calibration`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
@@ -353,44 +480,75 @@ export function buildBoard(
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  // The early radar: every rankable pre-token protocol below the watchlist floor, strongest TVL first.
-  // Never a replacement for a watchlist row: a chosen protocol stays chosen.
+  // The radar: every rankable pre-token protocol in the snapshot, watchlist or
+  // not, below the floor or above it. The floor marks where the watchlist
+  // starts, not where the radar stops: a launch the snapshot records is a
+  // launch the board ranks, so the biggest non-watchlist protocols — the ones
+  // the floor alone would have hidden — are ranked too. Never a replacement
+  // for a watchlist row: a chosen protocol stays chosen.
   const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
+    .filter((p) => !chosen.has(p.slug) && isRankable(p))
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
     const v = impliedValue(p, snapshot.as_of, model, cal);
-    return { p, ...v };
+    const cost = farmCostUsd(p);
+    const breakEven = (cost / Math.max(1, v.implied)) * 100;
+    return { p, ...v, cost, breakEven };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
-    rank: i + 1,
-    slug: s.p.slug,
-    name: s.p.name,
-    category: s.p.category,
-    chains: s.p.chains,
-    tvl_usd: s.p.tvl_usd,
-    change_7d: s.p.change_7d,
-    mcap_usd: s.p.mcap_usd,
-    listed_at: s.p.listed_at,
-    gecko_id: s.p.gecko_id,
-    symbol: s.p.symbol,
-    token_status: 'pre-token',
-    age_days: s.age,
-    implied_value_usd: s.implied,
-    model: {
-      category_multiple: round4(s.categoryMultiple),
-      category_comps: s.categoryComps,
-      growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
-      chain_multiplier: round4(s.chainMult),
+  // The verdicts are the board's own tertiles of the break-even share: the
+  // third of launches a farmer must capture least of to break even is FARM,
+  // the middle third THIN, the most expensive third SKIP. No threshold is
+  // guessed; the board grades itself.
+  const ordered = [...scored].sort((a, b) => a.breakEven - b.breakEven || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  const verdictOf = new Map<string, FarmVerdict>();
+  ordered.forEach((s, i) => {
+    const verdict: FarmVerdict = i < Math.ceil(ordered.length / 3) ? 'farm' : i < Math.ceil((ordered.length * 2) / 3) ? 'thin' : 'skip';
+    verdictOf.set(s.p.slug, verdict);
+  });
+  return scored.map((s, i) => {
+    const verdict = verdictOf.get(s.p.slug) ?? 'skip';
+    const breakEvenRounded = Math.round(s.breakEven * 1e6) / 1e6;
+    const steps = farmSteps(s.p, s.age).map(stepText);
+    steps.push(
+      stepText({
+        text: `Total cost of this plan is $${s.cost.toFixed(2)} ($${capitalFor(s.p)} of capital plus about $${(s.cost - capitalFor(s.p)).toFixed(2)} of gas over ${FARM_TX_COUNT} transactions). You break even by capturing just ${fmtBreakEvenPct(breakEvenRounded)}% of the $${s.implied.toLocaleString('en-US')} launch value. Verdict: ${verdict.toUpperCase()}.`,
+        cost: `$${s.cost.toFixed(2)} all in`,
+        time: `${holdDaysFor(s.age)} days`,
+      }),
+    );
+    return {
+      rank: i + 1,
+      slug: s.p.slug,
+      name: s.p.name,
+      category: s.p.category,
+      chains: s.p.chains,
+      tvl_usd: s.p.tvl_usd,
+      change_7d: s.p.change_7d,
+      mcap_usd: s.p.mcap_usd,
+      listed_at: s.p.listed_at,
+      gecko_id: s.p.gecko_id,
+      symbol: s.p.symbol,
+      token_status: 'pre-token',
       age_days: s.age,
-    },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
-  }));
+      implied_value_usd: s.implied,
+      model: {
+        category_multiple: round4(s.categoryMultiple),
+        category_comps: s.categoryComps,
+        growth_pct: s.growthPct,
+        growth_multiplier: round4(s.growthMult),
+        maturity_multiplier: round4(s.maturityMult),
+        chain_multiplier: round4(s.chainMult),
+        age_days: s.age,
+      },
+      farm_cost_usd: s.cost,
+      farm_break_even_pct: breakEvenRounded,
+      farm_verdict: verdict,
+      farm_steps: steps,
+    };
+  });
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -418,6 +576,32 @@ export function gasFor(chain: string): string {
     return 'about $0.10 to $1 of gas';
   if (['binance', 'bnb', 'avalanche', 'fantom', 'tron', 'celo', 'gnosis'].includes(c)) return 'about $0.10 to $0.50 of gas';
   return 'about $0.50 to $2 of gas';
+}
+
+/** One transaction's gas in dollars, the midpoint of the range gasFor states. */
+export function gasUsd(chain: string): number {
+  const c = chain.toLowerCase();
+  if (c === 'ethereum') return 7;
+  if (c === 'solana') return 0.01;
+  if (c === 'bitcoin') return 2;
+  if (['arbitrum', 'optimism', 'base', 'polygon', 'zksync', 'linea', 'blast', 'scroll', 'mantle', 'mode'].includes(c))
+    return 0.55;
+  if (['binance', 'bnb', 'avalanche', 'fantom', 'tron', 'celo', 'gnosis'].includes(c)) return 0.3;
+  return 1.25;
+}
+
+/** How many on-chain transactions the farm plan makes: set-up, second action and four weekly actions. */
+export const FARM_TX_COUNT = 6;
+
+/** What the whole farm plan costs: the capital plus gas over its transactions, in dollars. */
+export function farmCostUsd(p: SnapshotProtocol): number {
+  const chain = chainOf(p);
+  return Math.round((capitalFor(p) + gasUsd(chain) * FARM_TX_COUNT) * 100) / 100;
+}
+
+/** The share of a launch value, in percent, written so a tiny share still reads: four decimals down to 0.0001%, six below it. */
+export function fmtBreakEvenPct(pct: number): string {
+  return pct < 0.0001 ? pct.toFixed(6) : pct.toFixed(4);
 }
 
 /** How much capital one farm position needs, from the protocol's own TVL. */
@@ -601,6 +785,9 @@ export function radarRow(row: BoardRow): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
+    farm_cost_usd: row.farm_cost_usd,
+    farm_break_even_pct: row.farm_break_even_pct,
+    farm_verdict: row.farm_verdict,
   };
 }
 

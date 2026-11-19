@@ -1,7 +1,8 @@
-// Token Radar's dashboard, model radar-2. It reads window.RADAR (written
+// Token Radar's dashboard, model radar-3. It reads window.RADAR (written
 // beside dashboard/ by main.ts) and renders the ranked board, a filterable
-// table, a per-protocol detail drawer with the model's own inputs and the
-// protocol's farm plan, and the calibration table the multiple comes from.
+// table, a per-protocol detail drawer with the model's own inputs, the farm
+// economics and the protocol's farm plan, and the calibration table the
+// multiple comes from, plus the out-of-sample test of that calibration.
 // No network: every byte it shows is in data.js.
 (function () {
   'use strict';
@@ -145,12 +146,28 @@
     if (s.length < 20) s = s + " Hold the position and check the protocol's own page.";
     return s;
   }
+  // One transaction's gas in dollars, the midpoint of the range gasFor states.
+  function gasUsd(chain) {
+    var c = String(chain).toLowerCase();
+    if (c === 'ethereum') return 7;
+    if (c === 'solana') return 0.01;
+    if (c === 'bitcoin') return 2;
+    if (['arbitrum', 'optimism', 'base', 'polygon', 'zksync', 'linea', 'blast', 'scroll', 'mantle', 'mode'].indexOf(c) >= 0) return 0.55;
+    if (['binance', 'bnb', 'avalanche', 'fantom', 'tron', 'celo', 'gnosis'].indexOf(c) >= 0) return 0.3;
+    return 1.25;
+  }
+  // The plan's transactions: set-up, second action and four weekly actions.
+  var FARM_TX_COUNT = 6;
+  // A break-even share in percent, written so a tiny share still reads.
+  function fmtBreakEvenPct(pct) {
+    return pct < 0.0001 ? pct.toFixed(6) : pct.toFixed(4);
+  }
   function farmSteps(p) {
     var chain = chainOf(p);
     var capital = capitalFor(p);
     var hold = holdDaysFor(p.age_days);
     var gas = gasFor(chain);
-    return [
+    var steps = [
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
       { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and ' + gas, time: '15 minutes to set up' },
       { text: secondActionFor(p, capital, chain), cost: 'about $' + Math.max(10, Math.round(capital / 5)) + ' moved and ' + gas, time: '10 minutes' },
@@ -160,6 +177,18 @@
       { text: 'Never pay a fee to claim an airdrop and never type a seed phrase into a site: a real claim costs only gas.', cost: '$0, and walk away from any site that asks for more', time: '2 minutes' },
       { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' }
     ].map(stepText);
+    // The ninth step nets the plan: its total cost, the share of the launch
+    // value that breaks even, and the verdict. The numbers come from the row
+    // data.js carries, the same ones board.json holds.
+    var cost = typeof p.farm_cost_usd === 'number' ? p.farm_cost_usd : Math.round((capital + gasUsd(chain) * FARM_TX_COUNT) * 100) / 100;
+    var breakEven = typeof p.farm_break_even_pct === 'number' ? p.farm_break_even_pct : (cost / Math.max(1, p.implied_value_usd)) * 100;
+    var verdict = p.farm_verdict || 'skip';
+    steps.push(stepText({
+      text: 'Total cost of this plan is $' + cost.toFixed(2) + ' ($' + capital + ' of capital plus about $' + (cost - capital).toFixed(2) + ' of gas over ' + FARM_TX_COUNT + ' transactions). You break even by capturing just ' + fmtBreakEvenPct(breakEven) + '% of the $' + p.implied_value_usd.toLocaleString('en-US') + ' launch value. Verdict: ' + verdict.toUpperCase() + '.',
+      cost: '$' + cost.toFixed(2) + ' all in',
+      time: hold + ' days'
+    }));
+    return steps;
   }
 
   function readHash() {
@@ -191,12 +220,15 @@
   }
   function sortedRows(list) {
     var key = state.sort;
+    var verdictRank = { farm: 0, thin: 1, skip: 2 };
     return list.slice().sort(function (a, b) {
       var av, bv;
       if (key === 'name') { av = a.name.toLowerCase(); bv = b.name.toLowerCase(); }
       else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
+      else if (key === 'verdict') { av = verdictRank[a.farm_verdict] === undefined ? 3 : verdictRank[a.farm_verdict]; bv = verdictRank[b.farm_verdict] === undefined ? 3 : verdictRank[b.farm_verdict]; }
+      else if (key === 'cost') { av = a.farm_cost_usd; bv = b.farm_cost_usd; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -216,22 +248,26 @@
   }
 
   function lede() {
+    var verdictCounts = { farm: 0, thin: 0, skip: 0 };
+    DATA.rows.forEach(function (r) { if (verdictCounts[r.farm_verdict] !== undefined) verdictCounts[r.farm_verdict]++; });
     return el('section', { class: 'lede' },
       el('div', null,
         el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by implied value' }),
         el('p', null,
           'The watchlist is the floor: every protocol with at least ',
           el('b', { text: '$' + Math.round(DATA.floor_usd / 1e6) + 'M' }),
-          ' of TVL and no token on record. The early radar adds ',
+          ' of TVL and no token on record. The board ranks ',
+          el('b', { text: 'every rankable pre-token protocol' }),
+          ' in the snapshot — the watchlist and ',
           el('b', { text: String(DATA.early_size) }),
-          ' pre-token protocols below that floor. Implied value is a model, not a promise.'
+          ' more, below the floor or above it, including the biggest launches the floor alone would have hidden. Implied value is a model, not a promise.'
         )
       ),
       el('div', { class: 'facts' },
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
         el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Early rows below the floor' }), el('b', { text: String(DATA.early_size) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) }))
+        el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Farm verdicts' }), el('b', { text: verdictCounts.farm + ' farm / ' + verdictCounts.thin + ' thin / ' + verdictCounts.skip + ' skip' }))
       )
     );
   }
@@ -278,6 +314,7 @@
     list.forEach(function (r) {
       var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
       var growthClass = r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg';
+      var verdict = r.farm_verdict || 'skip';
       var tr = el('tr', {
         'data-selected': state.selected === r.slug ? 'true' : 'false',
         tabindex: '0',
@@ -296,6 +333,7 @@
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
         )),
+        el('td', null, el('span', { class: 'verdict verdict-' + verdict, text: verdict.toUpperCase() })),
         el('td', null, el('span', { class: 'status', text: 'no token' }))
       );
       tbody.appendChild(tr);
@@ -311,6 +349,7 @@
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
             sortHeader('implied', 'Implied value'),
+            sortHeader('verdict', 'Verdict'),
             el('th', { scope: 'col', text: 'Token' })
           )),
           tbody
@@ -359,7 +398,7 @@
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x category multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + ' + m.chain_step + ' x min(chains - 1, ' + m.chain_max_steps + ')) )'
       ),
-      el('p', { class: 'sub', text: 'The category multiple is calibrated from this snapshot: the median market-cap-to-TVL ratio of the live-token protocols in the same category (' + cal.global_comps + ' launch-comparable live protocols set the global median of ' + fmtMult(cal.global_multiple) + ' a category falls back to). TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Chains add up to ' + Math.round(m.chain_step * m.chain_max_steps * 100) + '% for a protocol live on more than one. The early radar is every rankable pre-token protocol below the watchlist floor, and the live-token protocols are set aside with their market caps shown.' }),
+      el('p', { class: 'sub', text: 'The category multiple is calibrated from this snapshot: the median market-cap-to-TVL ratio of the live-token protocols in the same category (' + cal.global_comps + ' launch-comparable live protocols set the global median of ' + fmtMult(cal.global_multiple) + ' a category falls back to). TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Chains add up to ' + Math.round(m.chain_step * m.chain_max_steps * 100) + '% for a protocol live on more than one. The board ranks every rankable pre-token protocol in the snapshot, below the floor or above it, and the live-token protocols are set aside with their market caps shown. Each farm plan is netted: its total cost, the share of the launch value that breaks even, and a farm / thin / skip verdict from the board\u2019s own tertiles of that share.' }),
       el('table', { class: 'calib' },
         el('thead', null, el('tr', null,
           el('th', { text: 'Category' }), el('th', { text: 'Multiple' }), el('th', { text: 'Live comps' }), el('th', { text: 'Source' })
@@ -403,6 +442,17 @@
         el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+    ));
+    dialog.appendChild(el('section', { class: 'detail-section' },
+      el('h3', { text: 'Farm economics' }),
+      el('div', { class: 'equation' },
+        el('div', null, el('span', { text: 'Total plan cost' }), el('b', { class: 'num', text: '$' + (typeof row.farm_cost_usd === 'number' ? row.farm_cost_usd.toFixed(2) : 'n/a') })),
+        el('div', null, el('span', { text: 'Capital in the position' }), el('b', { class: 'num', text: '$' + capitalFor(row) })),
+        el('div', null, el('span', { text: 'Gas over 6 transactions' }), el('b', { class: 'num', text: '$' + (typeof row.farm_cost_usd === 'number' ? (row.farm_cost_usd - capitalFor(row)).toFixed(2) : 'n/a') })),
+        el('div', null, el('span', { text: 'Break-even share of launch value' }), el('b', { class: 'num', text: (typeof row.farm_break_even_pct === 'number' ? fmtBreakEvenPct(row.farm_break_even_pct) : 'n/a') + '%' })),
+        el('div', { class: 'total' }, el('span', { text: 'Verdict' }), el('b', { class: 'num', text: (row.farm_verdict || 'skip').toUpperCase() }))
+      ),
+      el('p', { class: 'sub', text: 'You break even by capturing just ' + (typeof row.farm_break_even_pct === 'number' ? fmtBreakEvenPct(row.farm_break_even_pct) : 'n/a') + '% of the ' + fmtUsd(row.implied_value_usd) + ' launch value. The verdict is the board\u2019s own tertile of that share: the cheapest third to justify is FARM, the middle third THIN, the most expensive third SKIP.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
